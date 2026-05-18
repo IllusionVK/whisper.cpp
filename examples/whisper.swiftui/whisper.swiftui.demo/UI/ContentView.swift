@@ -8,22 +8,48 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack {
-                HStack {
-                    Button("Transcribe", action: {
+                VStack(spacing: 8) {
+                    HStack {
+                        Button("Transcribe", action: {
+                            Task {
+                                await whisperState.transcribeSample()
+                            }
+                        })
+                        .buttonStyle(.bordered)
+                        .disabled(!whisperState.canTranscribe || whisperState.isRecording || whisperState.isRealtimeTranscribing)
+
+                        Button(whisperState.isRecording ? "Stop recording" : "Start recording", action: {
+                            Task {
+                                await whisperState.toggleRecord()
+                            }
+                        })
+                        .buttonStyle(.bordered)
+                        .disabled((!whisperState.canTranscribe && !whisperState.isRecording) || whisperState.isRealtimeTranscribing)
+                    }
+
+                    Button(whisperState.isRealtimeTranscribing ? "Stop live" : "Start live", action: {
                         Task {
-                            await whisperState.transcribeSample()
+                            await whisperState.toggleRealtimeTranscription()
                         }
                     })
                     .buttonStyle(.bordered)
-                    .disabled(!whisperState.canTranscribe)
-                    
-                    Button(whisperState.isRecording ? "Stop recording" : "Start recording", action: {
-                        Task {
-                            await whisperState.toggleRecord()
+                    .disabled((!whisperState.canTranscribe && !whisperState.isRealtimeTranscribing) || whisperState.isRecording)
+                }
+
+                if whisperState.isRealtimeTranscribing || !whisperState.realtimeTranscript.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Live transcript")
+                            .font(.headline)
+
+                        ScrollView {
+                            Text(verbatim: whisperState.realtimeTranscript.isEmpty ? "Listening..." : whisperState.realtimeTranscript)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                    })
-                    .buttonStyle(.bordered)
-                    .disabled(!whisperState.canTranscribe)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, minHeight: 140, alignment: .topLeading)
+                    .background(Color.blue.opacity(0.08))
+                    .cornerRadius(10)
                 }
                 
                 ScrollView {
@@ -55,7 +81,7 @@ struct ContentView: View {
                     })
                     .font(.footnote)
                     .buttonStyle(.bordered)
-                    .disabled(!whisperState.canTranscribe)
+                    .disabled(!whisperState.canTranscribe || whisperState.isRecording || whisperState.isRealtimeTranscribing)
 
                     Button("Bench All", action: {
                         Task {
@@ -64,7 +90,7 @@ struct ContentView: View {
                     })
                     .font(.footnote)
                     .buttonStyle(.bordered)
-                    .disabled(!whisperState.canTranscribe)
+                    .disabled(!whisperState.canTranscribe || whisperState.isRecording || whisperState.isRealtimeTranscribing)
                 }
 
                 NavigationLink(destination: ModelsView(whisperState: whisperState)) {
