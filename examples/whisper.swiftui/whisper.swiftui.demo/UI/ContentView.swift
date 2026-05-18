@@ -64,6 +64,7 @@ struct ContentView: View {
                 HStack {
                     Button("Clear Logs", action: {
                         whisperState.messageLog = ""
+                        whisperState.realtimeTranscript = ""
                     })
                     .font(.footnote)
                     .buttonStyle(.bordered)

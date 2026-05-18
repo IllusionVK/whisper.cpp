@@ -19,9 +19,13 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var realtimeSamples: [Float] = []
     private var realtimeTask: Task<Void, Never>?
     private let realtimeSampleRate = 16000
-    private let realtimeTranscribeInterval: UInt64 = 2_000_000_000
+    private let realtimeTranscribeInterval: UInt64 = 500_000_000
     private let realtimeWindowSampleCount = 16000 * 8
     private let realtimeMinimumSampleCount = 16000
+    private let realtimeSilenceSampleLimit = 16000
+    private let realtimeSpeechEnergyThreshold: Float = 0.0005
+    private var realtimeSilentSampleCount = 0
+    private var realtimeLastTranscribedSampleCount = 0
     
     private var builtInModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin", subdirectory: "models")
@@ -184,6 +188,8 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                     do {
                         self.stopPlayback()
                         self.realtimeSamples.removeAll(keepingCapacity: true)
+                        self.realtimeSilentSampleCount = 0
+                        self.realtimeLastTranscribedSampleCount = 0
                         self.realtimeTranscript = ""
 
                         try self.realtimeRecorder.start { [weak self] samples in
@@ -217,6 +223,8 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         realtimeTask = nil
         realtimeRecorder.stop()
         realtimeSamples.removeAll(keepingCapacity: true)
+        realtimeSilentSampleCount = 0
+        realtimeLastTranscribedSampleCount = 0
         isRealtimeTranscribing = false
         canTranscribe = whisperContext != nil
 
@@ -230,7 +238,21 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             return
         }
 
-        realtimeSamples.append(contentsOf: samples)
+        let samplesToAppend: ArraySlice<Float>
+        if containsSpeech(samples) {
+            realtimeSilentSampleCount = 0
+            samplesToAppend = samples[...]
+        } else {
+            let remainingSilenceSamples = max(0, realtimeSilenceSampleLimit - realtimeSilentSampleCount)
+            realtimeSilentSampleCount += samples.count
+            samplesToAppend = samples.prefix(remainingSilenceSamples)
+        }
+
+        guard !samplesToAppend.isEmpty else {
+            return
+        }
+
+        realtimeSamples.append(contentsOf: samplesToAppend)
 
         let maximumSampleCount = realtimeSampleRate * 30
         if realtimeSamples.count > maximumSampleCount {
@@ -259,6 +281,12 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             return
         }
 
+        guard realtimeSamples.count != realtimeLastTranscribedSampleCount else {
+            return
+        }
+
+        realtimeLastTranscribedSampleCount = realtimeSamples.count
+
         let samples = Array(realtimeSamples.suffix(realtimeWindowSampleCount))
         await whisperContext.fullTranscribe(samples: samples)
         let text = (await whisperContext.getTranscription()).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -268,46 +296,107 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
 
         if !text.isEmpty {
-            mergeRealtimeTranscript(text)
+            updateRealtimeTranscript(with: text)
         }
     }
 
-    private func mergeRealtimeTranscript(_ latestText: String) {
-        let latestWords = latestText.split(whereSeparator: \.isWhitespace)
-        guard !latestWords.isEmpty else {
+    private func updateRealtimeTranscript(with text: String) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let latestWords = text.split(whereSeparator: \.isWhitespace)
+        let latestNormalizedWords = latestWords.map(normalizedTranscriptWord)
+        guard !latestNormalizedWords.isEmpty else {
             return
         }
 
-        if realtimeTranscript.isEmpty {
-            realtimeTranscript = latestWords.joined(separator: " ")
+        guard !realtimeTranscript.isEmpty else {
+            realtimeTranscript = text
             return
         }
 
-        let currentWords = realtimeTranscript.split(whereSeparator: \.isWhitespace)
-        let overlap = largestTranscriptOverlap(currentWords: currentWords, latestWords: latestWords)
-        let addition = latestWords.dropFirst(overlap).joined(separator: " ")
-        guard !addition.isEmpty else {
+        let currentNormalizedWords = realtimeTranscript
+            .split(whereSeparator: \.isWhitespace)
+            .map(normalizedTranscriptWord)
+
+        if isLaterSliceOfCurrentTranscript(latestWords: latestNormalizedWords, currentWords: currentNormalizedWords) {
             return
         }
 
-        realtimeTranscript += " " + addition
+        let commonPrefixCount = commonPrefixCount(currentNormalizedWords, latestNormalizedWords)
+        if latestNormalizedWords.count >= currentNormalizedWords.count, commonPrefixCount > 0 {
+            realtimeTranscript = text
+            return
+        }
+
+        if commonPrefixCount >= 3, latestNormalizedWords.count >= currentNormalizedWords.count - 1 {
+            realtimeTranscript = text
+            return
+        }
+
+        let overlapCount = largestSuffixPrefixOverlap(currentWords: currentNormalizedWords, latestWords: latestNormalizedWords)
+        guard overlapCount >= 3 else {
+            return
+        }
+
+        let addition = latestWords.dropFirst(overlapCount).joined(separator: " ")
+        if !addition.isEmpty {
+            realtimeTranscript += " " + addition
+        }
     }
 
-    private func largestTranscriptOverlap(currentWords: [Substring], latestWords: [Substring]) -> Int {
+    private func containsSpeech(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else {
+            return false
+        }
+
+        let energy = samples.reduce(Float(0)) { partialResult, sample in
+            partialResult + sample * sample
+        } / Float(samples.count)
+        return sqrt(energy) > realtimeSpeechEnergyThreshold
+    }
+
+    private func isLaterSliceOfCurrentTranscript(latestWords: [String], currentWords: [String]) -> Bool {
+        guard latestWords.count < currentWords.count else {
+            return false
+        }
+
+        for startIndex in currentWords.indices where startIndex > currentWords.startIndex {
+            guard currentWords.count - startIndex >= latestWords.count else {
+                continue
+            }
+
+            let currentSlice = currentWords[startIndex..<(startIndex + latestWords.count)]
+            if Array(currentSlice) == latestWords {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func largestSuffixPrefixOverlap(currentWords: [String], latestWords: [String]) -> Int {
         let maximumOverlap = min(currentWords.count, latestWords.count)
         guard maximumOverlap > 0 else {
             return 0
         }
 
-        for overlap in stride(from: maximumOverlap, through: 1, by: -1) {
-            let currentSuffix = currentWords.suffix(overlap).map(normalizedTranscriptWord)
-            let latestPrefix = latestWords.prefix(overlap).map(normalizedTranscriptWord)
-            if currentSuffix == latestPrefix {
-                return overlap
+        for overlapCount in stride(from: maximumOverlap, through: 1, by: -1) {
+            if Array(currentWords.suffix(overlapCount)) == Array(latestWords.prefix(overlapCount)) {
+                return overlapCount
             }
         }
 
         return 0
+    }
+
+    private func commonPrefixCount(_ firstWords: [String], _ secondWords: [String]) -> Int {
+        var count = 0
+        for (firstWord, secondWord) in zip(firstWords, secondWords) {
+            guard firstWord == secondWord else {
+                break
+            }
+            count += 1
+        }
+        return count
     }
 
     private func normalizedTranscriptWord(_ word: Substring) -> String {
